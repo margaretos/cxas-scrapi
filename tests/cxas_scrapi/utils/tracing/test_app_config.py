@@ -21,6 +21,8 @@ import pytest
 from cxas_scrapi.utils.tracing.app_config import (
     ENV_VAR_PLACEHOLDER,
     AppConfig,
+    collect_bool_env_var_placeholders,
+    preserve_bool_env_var_placeholders_on_pull,
     resolve_env_booleans_in_dir,
 )
 
@@ -806,3 +808,108 @@ def test_resolve_env_booleans_skips_variable_declarations(
     updated_app = json.loads((tmp_path / "app.json").read_text())
     assert updated_app["pinned"] is True
     assert updated_app["variableDeclarations"][0]["schema"]["nullable"] is False
+
+
+def test_preserve_bool_env_var_placeholders_roundtrip_app_and_components(
+    tmp_path: typing.Any,
+) -> None:
+    """Boolean $env_var placeholders survive simulated pull extraction,
+    including proto3-omitted False fields, without clobbering sibling env keys.
+    """
+    app_dir = _make_app_dir(
+        tmp_path,
+        app={
+            "displayName": "Roundtrip App",
+            "pinned": ENV_VAR_PLACEHOLDER,
+            "loggingSettings": {
+                "cloudLoggingSettings": {
+                    "enableCloudLogging": ENV_VAR_PLACEHOLDER,
+                }
+            },
+        },
+        env={
+            "app": {
+                "pinned": False,
+                "loggingSettings": {
+                    "cloudLoggingSettings": {"enableCloudLogging": True}
+                },
+                "variableDeclarations": [
+                    {
+                        "name": "keep_me",
+                        "schema": {"type": "STRING", "default": "ok"},
+                    }
+                ],
+            }
+        },
+    )
+    tool_dir = tmp_path / "tools" / "weather_tool"
+    tool_dir.mkdir(parents=True)
+    _write(
+        tool_dir / "weather_tool.json",
+        {
+            "displayName": "weather_tool",
+            "openApiTool": {"ignoreUnknownFields": ENV_VAR_PLACEHOLDER},
+        },
+    )
+    stale_dir = tmp_path / "tools" / "deleted_tool"
+    stale_dir.mkdir(parents=True)
+    _write(
+        stale_dir / "deleted_tool.json",
+        {
+            "displayName": "deleted_tool",
+            "openApiTool": {"ignoreUnknownFields": ENV_VAR_PLACEHOLDER},
+        },
+    )
+
+    snapshot = collect_bool_env_var_placeholders(app_dir)
+    assert snapshot
+
+    # Simulate CES export overwriting app.json (pinned=True, and omitting
+    # cloudLoggingSettings because enableCloudLogging became False in Cloud)
+    _write(
+        tmp_path / "app.json",
+        {"displayName": "Roundtrip App", "pinned": True},
+    )
+    _write(
+        tool_dir / "weather_tool.json",
+        {
+            "displayName": "weather_tool",
+            "openApiTool": {"ignoreUnknownFields": True},
+        },
+    )
+    # Simulate deleted_tool removed during pull --overwrite
+    os.remove(stale_dir / "deleted_tool.json")
+    os.rmdir(stale_dir)
+
+    count = preserve_bool_env_var_placeholders_on_pull(app_dir, snapshot)
+    assert count == 3
+
+    pulled_app = json.loads((tmp_path / "app.json").read_text())
+    assert pulled_app["pinned"] == ENV_VAR_PLACEHOLDER
+    assert (
+        pulled_app["loggingSettings"]["cloudLoggingSettings"][
+            "enableCloudLogging"
+        ]
+        == ENV_VAR_PLACEHOLDER
+    )
+
+    pulled_tool = json.loads((tool_dir / "weather_tool.json").read_text())
+    assert pulled_tool["openApiTool"]["ignoreUnknownFields"] == (
+        ENV_VAR_PLACEHOLDER
+    )
+
+    pulled_env = json.loads((tmp_path / "environment.json").read_text())
+    assert pulled_env["app"]["pinned"] is True
+    assert (
+        pulled_env["app"]["loggingSettings"]["cloudLoggingSettings"][
+            "enableCloudLogging"
+        ]
+        is False
+    )
+    assert pulled_env["app"]["variableDeclarations"] == [
+        {"name": "keep_me", "schema": {"type": "STRING", "default": "ok"}}
+    ]
+    assert pulled_env["tools"]["weather_tool"] == {
+        "openApiTool": {"ignoreUnknownFields": True}
+    }
+    assert "deleted_tool" not in pulled_env["tools"]

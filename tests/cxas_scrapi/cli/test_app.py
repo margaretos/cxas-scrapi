@@ -1496,3 +1496,141 @@ def test_app_lint_with_env_file_flag(
     assert excinfo.value.code == 1
     results = json.loads(capsys.readouterr().out)
     assert any(r["rule_id"] == "A017" for r in results)
+
+
+def test_app_pull_preserves_boolean_env_var_placeholders(
+    mock_apps_client: typing.Any,
+    mock_common_get_project_id: typing.Any,
+    mock_common_get_location: typing.Any,
+    tmp_path: typing.Any,
+) -> None:
+    import json  # noqa: PLC0415
+
+    app_dir = tmp_path / "Bool_Pull_App"
+    (app_dir / "tools" / "my_api").mkdir(parents=True)
+    (app_dir / "app.json").write_text(
+        json.dumps(
+            {
+                "displayName": "Bool Pull App",
+                "loggingSettings": {
+                    "bigqueryExportSettings": {
+                        "project": "$env_var",
+                        "dataset": "$env_var",
+                        "enabled": "$env_var",
+                    }
+                },
+                "variableDeclarations": [
+                    {
+                        "name": "enable_auth",
+                        "schema": {"type": "BOOLEAN", "default": "$env_var"},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (app_dir / "tools" / "my_api" / "my_api.json").write_text(
+        json.dumps(
+            {
+                "displayName": "my_api",
+                "openApiTool": {"ignoreUnknownFields": "$env_var"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(
+            "Bool_Pull_App/app.json",
+            json.dumps(
+                {
+                    "displayName": "Bool Pull App",
+                    "loggingSettings": {
+                        "bigqueryExportSettings": {
+                            "project": "$env_var",
+                            "dataset": "$env_var",
+                            "enabled": True,
+                        }
+                    },
+                    "variableDeclarations": [
+                        {
+                            "name": "enable_auth",
+                            "schema": {"type": "BOOLEAN", "default": False},
+                        }
+                    ],
+                }
+            ),
+        )
+        zf.writestr(
+            "Bool_Pull_App/tools/my_api/my_api.json",
+            json.dumps(
+                {
+                    "displayName": "my_api",
+                    "openApiTool": {"ignoreUnknownFields": True},
+                }
+            ),
+        )
+        zf.writestr(
+            "Bool_Pull_App/environment.json",
+            json.dumps(
+                {
+                    "app": {
+                        "loggingSettings": {
+                            "bigqueryExportSettings": {
+                                "project": "prod-proj",
+                                "dataset": "prod-ds",
+                            }
+                        }
+                    }
+                }
+            ),
+        )
+
+    mock_app = mock.MagicMock()
+    mock_app.name = "projects/test-project/locations/us/apps/123"
+    mock_apps_client.get_app_by_display_name.return_value = mock_app
+    lro = mock.MagicMock()
+    lro.result.return_value = mock.MagicMock(app_content=buf.getvalue())
+    mock_apps_client.export_app.return_value = lro
+
+    cli_app.app_pull(
+        argparse.Namespace(
+            app="Bool Pull App",
+            target_dir=str(tmp_path),
+            project_id="test-project",
+            location="us",
+            overwrite=False,
+        )
+    )
+
+    pulled_app = json.loads((app_dir / "app.json").read_text(encoding="utf-8"))
+    assert (
+        pulled_app["loggingSettings"]["bigqueryExportSettings"]["enabled"]
+        == "$env_var"
+    )
+    assert (
+        pulled_app["variableDeclarations"][0]["schema"]["default"] == "$env_var"
+    )
+
+    pulled_tool = json.loads(
+        (app_dir / "tools" / "my_api" / "my_api.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert pulled_tool["openApiTool"]["ignoreUnknownFields"] == "$env_var"
+
+    pulled_env = json.loads(
+        (app_dir / "environment.json").read_text(encoding="utf-8")
+    )
+    assert pulled_env["app"]["loggingSettings"]["bigqueryExportSettings"] == {
+        "project": "prod-proj",
+        "dataset": "prod-ds",
+        "enabled": True,
+    }
+    assert pulled_env["app"]["variableDeclarations"] == [
+        {"name": "enable_auth", "schema": {"type": "BOOLEAN", "default": False}}
+    ]
+    assert pulled_env["tools"]["my_api"] == {
+        "openApiTool": {"ignoreUnknownFields": True}
+    }

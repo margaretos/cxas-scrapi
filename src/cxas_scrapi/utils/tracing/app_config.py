@@ -907,3 +907,359 @@ def resolve_env_booleans_in_dir(agent_dir: str) -> bool:
             logger.debug(f"Could not update staged {env_path}: {e}")
 
     return any_modified
+
+
+def _extract_bool_placeholder_tree(
+    target: dict[str, Any],
+    desc: Descriptor,
+    skip_keys: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
+    """Extracts a nested dict of proto `bool` fields set to `"$env_var"`."""
+    extracted: dict[str, Any] = {}
+    for key, val in target.items():
+        if key in skip_keys:
+            continue
+        field = _resolve_proto_field(desc, key)
+        if field is None:
+            continue
+        if (
+            field.type == FieldDescriptor.TYPE_BOOL
+            and not field.is_repeated
+            and val == ENV_VAR_PLACEHOLDER
+        ):
+            extracted[key] = ENV_VAR_PLACEHOLDER
+        elif (
+            field.type == FieldDescriptor.TYPE_MESSAGE
+            and field.message_type is not None
+            and not field.message_type.full_name.startswith("google.protobuf.")
+        ):
+            if field.message_type.GetOptions().map_entry and isinstance(
+                val, dict
+            ):
+                val_field = field.message_type.fields_by_name["value"]
+                if val_field.type == FieldDescriptor.TYPE_BOOL:
+                    map_bools = {
+                        mk: ENV_VAR_PLACEHOLDER
+                        for mk, mv in val.items()
+                        if mv == ENV_VAR_PLACEHOLDER
+                    }
+                    if map_bools:
+                        extracted[key] = map_bools
+                elif (
+                    val_field.type == FieldDescriptor.TYPE_MESSAGE
+                    and val_field.message_type is not None
+                ):
+                    map_msgs: dict[str, Any] = {}
+                    for mk, mv in val.items():
+                        if isinstance(mv, dict):
+                            sub = _extract_bool_placeholder_tree(
+                                mv, val_field.message_type
+                            )
+                            if sub:
+                                map_msgs[mk] = sub
+                    if map_msgs:
+                        extracted[key] = map_msgs
+            elif not field.is_repeated and isinstance(val, dict):
+                sub = _extract_bool_placeholder_tree(val, field.message_type)
+                if sub:
+                    extracted[key] = sub
+    return extracted
+
+
+def _apply_bool_placeholder_tree(
+    target: dict[str, Any],
+    tree: dict[str, Any],
+    desc: Descriptor,
+) -> tuple[dict[str, Any], int]:
+    """Restores `"$env_var"` into `target` and returns
+    `(env_updates, count)`.
+    """
+    env_updates: dict[str, Any] = {}
+    count = 0
+    for key, t_val in tree.items():
+        field = _resolve_proto_field(desc, key)
+        if field is None:
+            continue
+        target_key = next(
+            (k for k in (key, field.camelcase_name, field.name) if k in target),
+            key,
+        )
+        if (
+            field.type == FieldDescriptor.TYPE_BOOL
+            and not field.is_repeated
+            and t_val == ENV_VAR_PLACEHOLDER
+        ):
+            coerced = _coerce_bool(target.get(target_key))
+            # Proto3 JSON export omits scalar bool fields whose value is False
+            exported_bool = coerced if coerced is not None else False
+            target[target_key] = ENV_VAR_PLACEHOLDER
+            env_updates[target_key] = exported_bool
+            count += 1
+        elif (
+            field.type == FieldDescriptor.TYPE_MESSAGE
+            and field.message_type is not None
+            and not field.message_type.full_name.startswith("google.protobuf.")
+        ):
+            if field.message_type.GetOptions().map_entry and isinstance(
+                t_val, dict
+            ):
+                target_map = target.get(target_key)
+                if not isinstance(target_map, dict):
+                    continue
+                val_field = field.message_type.fields_by_name["value"]
+                if val_field.type == FieldDescriptor.TYPE_BOOL:
+                    map_updates: dict[str, Any] = {}
+                    for mk in t_val:
+                        if mk in target_map:
+                            coerced = _coerce_bool(target_map.get(mk))
+                            map_updates[mk] = (
+                                coerced if coerced is not None else False
+                            )
+                            target_map[mk] = ENV_VAR_PLACEHOLDER
+                            count += 1
+                    if map_updates:
+                        env_updates[target_key] = map_updates
+                elif (
+                    val_field.type == FieldDescriptor.TYPE_MESSAGE
+                    and val_field.message_type is not None
+                ):
+                    msg_map_updates: dict[str, Any] = {}
+                    for mk, sub_tree in t_val.items():
+                        if isinstance(sub_tree, dict) and isinstance(
+                            target_map.get(mk), dict
+                        ):
+                            sub_upd, sub_cnt = _apply_bool_placeholder_tree(
+                                target_map[mk],
+                                sub_tree,
+                                val_field.message_type,
+                            )
+                            if sub_cnt:
+                                msg_map_updates[mk] = sub_upd
+                                count += sub_cnt
+                    if msg_map_updates:
+                        env_updates[target_key] = msg_map_updates
+            elif not field.is_repeated and isinstance(t_val, dict):
+                sub_target = target.get(target_key)
+                created_sub = False
+                if not isinstance(sub_target, dict):
+                    sub_target = {}
+                    created_sub = True
+                sub_upd, sub_cnt = _apply_bool_placeholder_tree(
+                    sub_target, t_val, field.message_type
+                )
+                if sub_cnt:
+                    if created_sub:
+                        target[target_key] = sub_target
+                    env_updates[target_key] = sub_upd
+                    count += sub_cnt
+    return env_updates, count
+
+
+def _deep_merge_env_dict(dst: dict[str, Any], src: dict[str, Any]) -> None:
+    """Recursively merges `src` into `dst` without overwriting sibling keys."""
+    for key, val in src.items():
+        if isinstance(val, dict) and isinstance(dst.get(key), dict):
+            _deep_merge_env_dict(dst[key], val)
+        else:
+            dst[key] = val
+
+
+def collect_bool_env_var_placeholders(app_dir: str | Path) -> dict[str, Any]:
+    """Captures boolean `"$env_var"` placeholder trees prior to `cxas pull`."""
+    root = str(app_dir)
+    if not os.path.isdir(root):
+        return {}
+
+    app_tree: dict[str, Any] = {}
+    app_desc = _RESOURCE_DESCRIPTORS["app"]
+    for fname, is_yaml in (("app.json", False), ("app.yaml", True)):
+        fpath = os.path.join(root, fname)
+        if not os.path.isfile(fpath):
+            continue
+        try:
+            with open(fpath, encoding="utf-8") as f:
+                data = yaml.safe_load(f) if is_yaml else json.load(f)
+            if isinstance(data, dict):
+                target = (
+                    data["app"] if isinstance(data.get("app"), dict) else data
+                )
+                extracted = _extract_bool_placeholder_tree(
+                    target, app_desc, skip_keys=_APP_VAR_DECL_KEYS
+                )
+                if extracted:
+                    _deep_merge_env_dict(app_tree, extracted)
+        except Exception:
+            continue
+
+    comp_trees: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {}
+    for category in _COMPONENT_CATEGORIES:
+        cat_dir = os.path.join(root, category)
+        cat_desc = _RESOURCE_DESCRIPTORS[category]
+        for entry, fpath, is_yaml in _iter_component_manifests(cat_dir):
+            try:
+                with open(fpath, encoding="utf-8") as f:
+                    comp_data = yaml.safe_load(f) if is_yaml else json.load(f)
+                if not isinstance(comp_data, dict):
+                    continue
+                extracted = _extract_bool_placeholder_tree(comp_data, cat_desc)
+                if extracted:
+                    disp = comp_data.get("displayName") or comp_data.get(
+                        "display_name"
+                    )
+                    comp_key = disp if isinstance(disp, str) and disp else entry
+                    comp_trees[(category, entry)] = (comp_key, extracted)
+            except Exception:
+                continue
+
+    if not app_tree and not comp_trees:
+        return {}
+    return {"app": app_tree, "components": comp_trees}
+
+
+def preserve_bool_env_var_placeholders_on_pull(
+    app_dir: str | Path,
+    snapshot: dict[str, Any],
+) -> int:
+    """Restores boolean `"$env_var"` placeholders after `cxas pull` extraction
+    and records exported boolean values in `environment.json`.
+    """
+    if not snapshot:
+        return 0
+
+    root = str(app_dir)
+    total_preserved = 0
+    app_env_updates: dict[str, Any] = {}
+    comp_env_updates: list[tuple[str, str, str, dict[str, Any]]] = []
+
+    app_tree = snapshot.get("app")
+    if isinstance(app_tree, dict) and app_tree:
+        app_desc = _RESOURCE_DESCRIPTORS["app"]
+        for fname, is_yaml in (("app.json", False), ("app.yaml", True)):
+            fpath = os.path.join(root, fname)
+            if not os.path.isfile(fpath):
+                continue
+            try:
+                with open(fpath, encoding="utf-8") as f:
+                    data = yaml.safe_load(f) if is_yaml else json.load(f)
+                if not isinstance(data, dict):
+                    continue
+                target = (
+                    data["app"] if isinstance(data.get("app"), dict) else data
+                )
+                upd, cnt = _apply_bool_placeholder_tree(
+                    target, app_tree, app_desc
+                )
+                if cnt:
+                    with open(fpath, "w", encoding="utf-8") as f:
+                        if is_yaml:
+                            yaml.safe_dump(data, f, sort_keys=False)
+                        else:
+                            json.dump(data, f, indent=2)
+                            f.write("\n")
+                    _deep_merge_env_dict(app_env_updates, upd)
+                    total_preserved += cnt
+            except Exception as e:
+                logger.warning(
+                    f"Failed to preserve boolean placeholders in {fpath}: {e}"
+                )
+
+    comp_trees = snapshot.get("components")
+    if isinstance(comp_trees, dict) and comp_trees:
+        for category in _COMPONENT_CATEGORIES:
+            cat_dir = os.path.join(root, category)
+            cat_desc = _RESOURCE_DESCRIPTORS[category]
+            for entry, fpath, is_yaml in _iter_component_manifests(cat_dir):
+                saved = comp_trees.get((category, entry))
+                if not saved:
+                    continue
+                prev_key, c_tree = saved
+                try:
+                    with open(fpath, encoding="utf-8") as f:
+                        comp_data = (
+                            yaml.safe_load(f) if is_yaml else json.load(f)
+                        )
+                    if not isinstance(comp_data, dict):
+                        continue
+                    upd, cnt = _apply_bool_placeholder_tree(
+                        comp_data, c_tree, cat_desc
+                    )
+                    if cnt:
+                        with open(fpath, "w", encoding="utf-8") as f:
+                            if is_yaml:
+                                yaml.safe_dump(comp_data, f, sort_keys=False)
+                            else:
+                                json.dump(comp_data, f, indent=2)
+                                f.write("\n")
+                        disp = comp_data.get("displayName") or comp_data.get(
+                            "display_name"
+                        )
+                        comp_key = (
+                            disp if isinstance(disp, str) and disp else prev_key
+                        )
+                        comp_env_updates.append(
+                            (category, entry, comp_key, upd)
+                        )
+                        total_preserved += cnt
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to preserve boolean placeholders in {fpath}: "
+                        f"{e}"
+                    )
+
+    if not total_preserved:
+        return 0
+
+    env_path = os.path.join(root, "environment.json")
+    env_data: dict[str, Any] = {}
+    if os.path.isfile(env_path):
+        try:
+            with open(env_path, encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                env_data = loaded
+        except (OSError, ValueError):
+            env_data = {}
+
+    if app_env_updates:
+        app_section = env_data.get("app")
+        if not isinstance(app_section, dict):
+            app_section = {}
+            env_data["app"] = app_section
+        for key, val in app_env_updates.items():
+            # Keep root-level placement only if already present at root and
+            # absent from env_data["app"]
+            if key in env_data and key not in app_section:
+                if isinstance(val, dict) and isinstance(env_data[key], dict):
+                    _deep_merge_env_dict(env_data[key], val)
+                else:
+                    env_data[key] = val
+            elif isinstance(val, dict) and isinstance(
+                app_section.get(key), dict
+            ):
+                _deep_merge_env_dict(app_section[key], val)
+            else:
+                app_section[key] = val
+        if not app_section:
+            env_data.pop("app", None)
+
+    for category, entry, comp_key, upd in comp_env_updates:
+        cat_section = env_data.get(category)
+        if not isinstance(cat_section, dict):
+            cat_section = {}
+            env_data[category] = cat_section
+        target_comp_key = (
+            entry
+            if entry in cat_section and comp_key not in cat_section
+            else comp_key
+        )
+        comp_section = cat_section.get(target_comp_key)
+        if not isinstance(comp_section, dict):
+            cat_section[target_comp_key] = upd
+        else:
+            _deep_merge_env_dict(comp_section, upd)
+
+    with open(env_path, "w", encoding="utf-8") as f:
+        json.dump(env_data, f, indent=2)
+        f.write("\n")
+
+    return total_preserved

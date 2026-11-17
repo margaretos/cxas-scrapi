@@ -218,6 +218,15 @@ def _app_pull(
                 except (OSError, ValueError):
                     prev_env_defaults = {}
 
+            from cxas_scrapi.utils.tracing.app_config import (  # noqa: PLC0415
+                collect_bool_env_var_placeholders,
+                preserve_bool_env_var_placeholders_on_pull,
+            )
+
+            prev_bool_placeholders = collect_bool_env_var_placeholders(
+                pulled_app_root
+            )
+
             if dest_app_root is not None:
                 os.makedirs(dest_app_root, exist_ok=True)
                 abs_dest_root = os.path.abspath(dest_app_root)
@@ -341,6 +350,18 @@ def _app_pull(
                 print(
                     "Preserved $env_var placeholders for "
                     f"{len(preserved)} variable(s) in app config and updated "
+                    "environment.json."
+                )
+
+        if prev_bool_placeholders:
+            preserved_bools = preserve_bool_env_var_placeholders_on_pull(
+                pulled_app_root,
+                prev_bool_placeholders,
+            )
+            if preserved_bools:
+                print(
+                    "Preserved $env_var placeholders for "
+                    f"{preserved_bools} boolean field(s) and updated "
                     "environment.json."
                 )
 
