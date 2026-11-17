@@ -14,11 +14,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import logging
 import typing
 from typing import Any
 
-from google.cloud.ces_v1beta import AgentServiceClient, types
+from google.api_core import exceptions as google_exceptions
+from google.cloud.ces_v1beta import (
+    AgentServiceClient,
+    EvaluationServiceClient,
+    types,
+)
 from google.protobuf import field_mask_pb2
 
 from cxas_scrapi.core.common import Common
@@ -161,10 +167,118 @@ class Apps(Common):
         )
         return self.client.update_app(request=request)
 
+    def _delete_app_deployments(self, app_name: str) -> None:
+        """Deletes active deployments under ``app_name``."""
+        deployments = list(
+            self.client.list_deployments(
+                request=types.ListDeploymentsRequest(parent=app_name)
+            )
+        )
+        for dep in deployments:
+            with contextlib.suppress(google_exceptions.NotFound):
+                op = self.client.delete_deployment(
+                    request=types.DeleteDeploymentRequest(name=dep.name)
+                )
+                if hasattr(op, "result"):
+                    op.result()
+
+    def _delete_app_children(self, app_name: str) -> None:
+        """Deletes remaining child resources blocking app deletion."""
+        for version in list(
+            self.client.list_app_versions(
+                request=types.ListAppVersionsRequest(parent=app_name)
+            )
+        ):
+            with contextlib.suppress(google_exceptions.NotFound):
+                self.client.delete_app_version(
+                    request=types.DeleteAppVersionRequest(name=version.name)
+                )
+
+        eval_client = EvaluationServiceClient(
+            transport=self.get_grpc_transport(EvaluationServiceClient),
+            client_info=self.client_info,
+        )
+        for ev in list(eval_client.list_evaluations(parent=app_name)):
+            with contextlib.suppress(google_exceptions.NotFound):
+                eval_client.delete_evaluation(
+                    request=types.DeleteEvaluationRequest(
+                        name=ev.name, force=True
+                    )
+                )
+
+        for agent in list(
+            self.client.list_agents(
+                request=types.ListAgentsRequest(parent=app_name)
+            )
+        ):
+            with contextlib.suppress(google_exceptions.NotFound):
+                self.client.delete_agent(
+                    request=types.DeleteAgentRequest(
+                        name=agent.name, force=True
+                    )
+                )
+
+        for gr in list(
+            self.client.list_guardrails(
+                request=types.ListGuardrailsRequest(parent=app_name)
+            )
+        ):
+            with contextlib.suppress(google_exceptions.NotFound):
+                self.client.delete_guardrail(
+                    request=types.DeleteGuardrailRequest(
+                        name=gr.name, force=True
+                    )
+                )
+
+        for tool in list(
+            self.client.list_tools(
+                request=types.ListToolsRequest(parent=app_name)
+            )
+        ):
+            with contextlib.suppress(google_exceptions.NotFound):
+                self.client.delete_tool(
+                    request=types.DeleteToolRequest(name=tool.name, force=True)
+                )
+
+        for toolset in list(
+            self.client.list_toolsets(
+                request=types.ListToolsetsRequest(parent=app_name)
+            )
+        ):
+            with contextlib.suppress(google_exceptions.NotFound):
+                self.client.delete_toolset(
+                    request=types.DeleteToolsetRequest(
+                        name=toolset.name, force=True
+                    )
+                )
+
+        for example in list(
+            self.client.list_examples(
+                request=types.ListExamplesRequest(parent=app_name)
+            )
+        ):
+            with contextlib.suppress(google_exceptions.NotFound):
+                self.client.delete_example(
+                    request=types.DeleteExampleRequest(name=example.name)
+                )
+
     def delete_app(self, app_name: str, force: bool = False) -> None:
-        """Deletes a specific app."""
+        """Deletes a specific app, optionally removing child resources first."""
+        if force:
+            self._delete_app_deployments(app_name)
+
         request = types.DeleteAppRequest(name=app_name)
-        self.client.delete_app(request=request)
+        try:
+            operation = self.client.delete_app(request=request)
+            if hasattr(operation, "result"):
+                operation.result()
+        except google_exceptions.FailedPrecondition:
+            if not force:
+                raise
+            self._delete_app_children(app_name)
+            operation = self.client.delete_app(request=request)
+            if hasattr(operation, "result"):
+                operation.result()
 
     def export_app(
         self,

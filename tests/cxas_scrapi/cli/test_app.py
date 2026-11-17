@@ -640,7 +640,7 @@ def test_app_delete_by_app_id(
 
 def test_app_delete_by_display_name(mock_apps_client: typing.Any) -> None:
     args = argparse.Namespace(
-        app_id=None,
+        app_name=None,
         display_name="My App",
         project_id="test-project",
         location="us",
@@ -663,7 +663,7 @@ def test_app_delete_missing_args(
     mock_apps_client: typing.Any, capsys: typing.Any
 ) -> None:
     args = argparse.Namespace(
-        app_id=None,
+        app_name=None,
         display_name=None,
         project_id="test-project",
         location="us",

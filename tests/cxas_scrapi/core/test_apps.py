@@ -351,3 +351,69 @@ def test_update_app_sparse(
     assert app_arg.name == "projects/mock-project/locations/us/apps/test-app"
     assert app_arg.display_name == "Updated App Name"
     assert "display_name" in mask_arg.paths
+
+
+@patch("cxas_scrapi.core.apps.AgentServiceClient")
+def test_delete_app_waits_for_lro(mock_client_cls: typing.Any) -> None:
+    mock_client = mock_client_cls.return_value
+    mock_op = MagicMock()
+    mock_client.delete_app.return_value = mock_op
+
+    apps_client = Apps(
+        project_id="mock-project", location="us", creds=MagicMock()
+    )
+    apps_client.delete_app(
+        "projects/mock-project/locations/us/apps/test-app", force=False
+    )
+
+    mock_client.list_deployments.assert_not_called()
+    mock_client.delete_app.assert_called_once()
+    mock_op.result.assert_called_once()
+
+
+@patch("cxas_scrapi.core.apps.EvaluationServiceClient")
+@patch("cxas_scrapi.core.apps.AgentServiceClient")
+def test_delete_app_force_cleans_deployments_and_retries_on_precondition(
+    mock_client_cls: typing.Any, mock_eval_client_cls: typing.Any
+) -> None:
+    from google.api_core import exceptions as google_exceptions  # noqa: PLC0415
+
+    mock_client = mock_client_cls.return_value
+    mock_eval_client = mock_eval_client_cls.return_value
+
+    dep = MagicMock()
+    dep.name = "projects/p/locations/us/apps/a1/deployments/d1"
+    mock_client.list_deployments.return_value = [dep]
+
+    ver = MagicMock()
+    ver.name = "projects/p/locations/us/apps/a1/versions/v1"
+    mock_client.list_app_versions.return_value = [ver]
+
+    ev = MagicMock()
+    ev.name = "projects/p/locations/us/apps/a1/evaluations/e1"
+    mock_eval_client.list_evaluations.return_value = [ev]
+
+    ag = MagicMock()
+    ag.name = "projects/p/locations/us/apps/a1/agents/ag1"
+    mock_client.list_agents.return_value = [ag]
+    mock_client.list_guardrails.return_value = []
+    mock_client.list_tools.return_value = []
+    mock_client.list_toolsets.return_value = []
+    mock_client.list_examples.return_value = []
+
+    first_op = MagicMock()
+    first_op.result.side_effect = google_exceptions.FailedPrecondition(
+        "App still has child resources"
+    )
+    second_op = MagicMock()
+    mock_client.delete_app.side_effect = [first_op, second_op]
+
+    apps_client = Apps(project_id="p", location="us", creds=MagicMock())
+    apps_client.delete_app("projects/p/locations/us/apps/a1", force=True)
+
+    mock_client.delete_deployment.assert_called_once()
+    mock_client.delete_app_version.assert_called_once()
+    mock_eval_client.delete_evaluation.assert_called_once()
+    mock_client.delete_agent.assert_called_once()
+    assert mock_client.delete_app.call_count == 2
+    second_op.result.assert_called_once()
