@@ -19,10 +19,12 @@ import typing
 from typing import Any
 
 from google.cloud.ces_v1beta import types
-from google.protobuf import field_mask_pb2
+from google.protobuf import field_mask_pb2, json_format
 
 from cxas_scrapi.core.apps import Apps
 from cxas_scrapi.core.common import Common
+
+_DEFAULT_DENY_RESPONSE = "I cannot help with that request."
 
 
 class Guardrails(Apps):
@@ -91,12 +93,60 @@ class Guardrails(Apps):
         )
         return self.client.get_guardrail(request=request)
 
+    @staticmethod
+    def _normalize_trigger_action(
+        action: types.TriggerAction | dict[str, Any] | str | None,
+    ) -> types.TriggerAction:
+        """Converts shorthand or dict actions into a ``types.TriggerAction``."""
+        if action is None:
+            return types.TriggerAction(
+                respond_immediately=types.TriggerAction.RespondImmediately(
+                    responses=[
+                        types.TriggerAction.Response(
+                            text=_DEFAULT_DENY_RESPONSE
+                        )
+                    ]
+                )
+            )
+        if isinstance(action, types.TriggerAction):
+            return action
+        if isinstance(action, dict):
+            try:
+                return types.TriggerAction(**action)
+            except (TypeError, ValueError):
+                parsed = types.TriggerAction()
+                json_format.ParseDict(action, parsed._pb)
+                return parsed
+        if isinstance(action, str):
+            norm = action.strip().upper()
+            if norm == "DENY":
+                return types.TriggerAction(
+                    respond_immediately=types.TriggerAction.RespondImmediately(
+                        responses=[
+                            types.TriggerAction.Response(
+                                text=_DEFAULT_DENY_RESPONSE
+                            )
+                        ]
+                    )
+                )
+            if norm == "GENERATIVE_ANSWER":
+                return types.TriggerAction(
+                    generative_answer=types.TriggerAction.GenerativeAnswer()
+                )
+            raise ValueError(
+                f"Unsupported guardrail action '{action}'. Expected a "
+                "TriggerAction, dict, 'DENY', 'GENERATIVE_ANSWER', or None."
+            )
+        raise TypeError(
+            f"Unsupported guardrail action type: {type(action).__name__}"
+        )
+
     def create_guardrail(
         self,
         guardrail_id: str,
         display_name: str,
         payload: dict[str, Any],
-        action: str = "DENY",
+        action: types.TriggerAction | dict[str, Any] | str | None = None,
         description: str = "",
         enabled: bool = True,
     ) -> types.Guardrail:
@@ -106,18 +156,18 @@ class Guardrails(Apps):
         types is instantiated (content_filter, llm_policy,
         llm_prompt_security, model_safety, code_callback).
         """
-        # Ensure any existing basic field inside payload doesn't conflict
-        if "display_name" in payload:
-            payload.pop("display_name")
-        if "description" in payload:
-            payload.pop("description")
+        payload_copy = dict(payload)
+        payload_copy.pop("display_name", None)
+        payload_copy.pop("description", None)
+        payload_action = payload_copy.pop("action", None)
+        effective_action = action if action is not None else payload_action
 
         guardrail = types.Guardrail(
             display_name=display_name,
             description=description,
-            action=action,
+            action=self._normalize_trigger_action(effective_action),
             enabled=enabled,
-            **payload,
+            **payload_copy,
         )
 
         request = types.CreateGuardrailRequest(
@@ -135,7 +185,12 @@ class Guardrails(Apps):
         mask_paths = []
 
         for key, value in kwargs.items():
-            setattr(guardrail, key, value)
+            resolved_value = (
+                self._normalize_trigger_action(value)
+                if key == "action" and value is not None
+                else value
+            )
+            setattr(guardrail, key, resolved_value)
             mask_paths.append(key)
 
         request = types.UpdateGuardrailRequest(

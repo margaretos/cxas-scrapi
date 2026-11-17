@@ -15,6 +15,9 @@
 import typing
 from unittest.mock import MagicMock, patch
 
+import pytest
+from google.cloud.ces_v1beta import types
+
 from cxas_scrapi.core.guardrails import Guardrails
 
 
@@ -65,25 +68,12 @@ def test_get_guardrail(mock_client_cls: typing.Any) -> None:
     mock_client.get_guardrail.assert_called_once()
 
 
-@patch("cxas_scrapi.core.guardrails.types.Guardrail")
-@patch("cxas_scrapi.core.guardrails.types.CreateGuardrailRequest")
 @patch("cxas_scrapi.core.apps.AgentServiceClient")
 def test_create_guardrail(
     mock_client_cls: typing.Any,
-    mock_req_cls: typing.Any,
-    mock_gr_cls: typing.Any,
 ) -> None:
     mock_client = mock_client_cls.return_value
     mock_client.create_guardrail.return_value = MagicMock()
-
-    def side_effect(**kwargs: typing.Any) -> typing.Any:
-        m = MagicMock()
-        for k, v in kwargs.items():
-            setattr(m, k, v)
-        return m
-
-    mock_req_cls.side_effect = side_effect
-    mock_gr_cls.side_effect = side_effect
 
     grs = Guardrails("projects/p/locations/l/apps/A")
 
@@ -94,32 +84,63 @@ def test_create_guardrail(
     grs.create_guardrail("gr_id", "my_gr", payload=payload)
     mock_client.create_guardrail.assert_called_once()
 
+    # Caller's payload dictionary must not be mutated in place
+    assert "display_name" in payload
+
     args = mock_client.create_guardrail.call_args[1]["request"]
     assert args.parent == "projects/p/locations/l/apps/A"
     assert args.guardrail_id == "gr_id"
     assert args.guardrail.display_name == "my_gr"
     assert args.guardrail.model_safety is not None
+    assert len(args.guardrail.action.respond_immediately.responses) == 1
 
 
-@patch("cxas_scrapi.core.guardrails.types.Guardrail")
-@patch("cxas_scrapi.core.guardrails.types.UpdateGuardrailRequest")
+@patch("cxas_scrapi.core.apps.AgentServiceClient")
+def test_create_guardrail_action_variants(
+    mock_client_cls: typing.Any,
+) -> None:
+    mock_client = mock_client_cls.return_value
+    mock_client.create_guardrail.return_value = MagicMock()
+
+    grs = Guardrails("projects/p/locations/l/apps/A")
+    base_payload = {
+        "content_filter": {
+            "banned_contents": ["secret"],
+            "match_type": (
+                types.Guardrail.ContentFilter.MatchType.SIMPLE_STRING_MATCH
+            ),
+        }
+    }
+
+    # Explicit "DENY" string shorthand
+    grs.create_guardrail(
+        "gr_deny", "Deny Guardrail", payload=base_payload, action="DENY"
+    )
+    req_deny = mock_client.create_guardrail.call_args[1]["request"]
+    assert len(req_deny.guardrail.action.respond_immediately.responses) == 1
+
+    # CamelCase dict action inside payload
+    grs.create_guardrail(
+        "gr_gen",
+        "Gen Guardrail",
+        payload={**base_payload, "action": {"generativeAnswer": {}}},
+    )
+    req_gen = mock_client.create_guardrail.call_args[1]["request"]
+    assert "generative_answer" in req_gen.guardrail.action
+
+    # Unknown string action raises ValueError
+    with pytest.raises(ValueError, match="Unsupported guardrail action"):
+        grs.create_guardrail(
+            "gr_bad", "Bad Guardrail", payload=base_payload, action="UNKNOWN"
+        )
+
+
 @patch("cxas_scrapi.core.apps.AgentServiceClient")
 def test_update_guardrail(
     mock_client_cls: typing.Any,
-    mock_req_cls: typing.Any,
-    mock_gr_cls: typing.Any,
 ) -> None:
     mock_client = mock_client_cls.return_value
     mock_client.update_guardrail.return_value = MagicMock()
-
-    def side_effect(**kwargs: typing.Any) -> typing.Any:
-        m = MagicMock()
-        for k, v in kwargs.items():
-            setattr(m, k, v)
-        return m
-
-    mock_req_cls.side_effect = side_effect
-    mock_gr_cls.side_effect = side_effect
 
     grs = Guardrails("projects/p/locations/l/apps/A")
     grs.update_guardrail("gr_id", action="DENY")
@@ -129,7 +150,8 @@ def test_update_guardrail(
     assert (
         args.guardrail.name == "projects/p/locations/l/apps/A/guardrails/gr_id"
     )
-    assert args.guardrail.action == "DENY"
+    assert len(args.guardrail.action.respond_immediately.responses) == 1
+    assert list(args.update_mask.paths) == ["action"]
 
 
 @patch("cxas_scrapi.core.guardrails.types.DeleteGuardrailRequest")
