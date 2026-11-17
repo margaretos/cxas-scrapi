@@ -89,17 +89,24 @@ def tools_delete(args: argparse.Namespace) -> None:
         if "/tools/" in args.name or "/toolsets/" in args.name:
             resolved_name = args.name
         else:
-            # 2. Map display name to resource name using reverse map
+            # 2. Map display name to resource name using reverse map (ignoring
+            # toolset sub-operation keys until toolset display names are checked)
             tools_map = tools_client.get_tools_map(reverse=True)
-            if args.name in tools_map:
-                resolved_name = tools_map[args.name]
+            mapped = tools_map.get(args.name)
+            if mapped and not ("/toolsets/" in mapped and "/tools/" in mapped):
+                resolved_name = mapped
             else:
-                # 3. Fallback: check trailing ID
+                # 3. Check list_tools() by display_name or trailing resource ID
                 tools_list_res = tools_client.list_tools()
                 for t in tools_list_res:
-                    if t.name.split("/")[-1] == args.name:
+                    if (
+                        t.display_name == args.name
+                        or t.name.split("/")[-1] == args.name
+                    ):
                         resolved_name = t.name
                         break
+                if not resolved_name and mapped:
+                    resolved_name = mapped
 
         if not resolved_name:
             print(f"Error: Tool/Toolset '{args.name}' not found in app.")

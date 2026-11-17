@@ -303,6 +303,17 @@ def test_delete_tool(
     args2 = mock_client.delete_toolset.call_args[1]["request"]
     assert args2.name == "projects/p/locations/l/apps/A/toolsets/TS"
 
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"Cannot delete individual toolset operation.*"
+            r"projects/p/locations/l/apps/A/toolsets/TS"
+        ),
+    ):
+        t.delete_tool(
+            "projects/p/locations/l/apps/A/toolsets/TS/tools/getWeather"
+        )
+
 
 @patch("requests.post")
 @patch("cxas_scrapi.core.tools.AgentServiceClient")

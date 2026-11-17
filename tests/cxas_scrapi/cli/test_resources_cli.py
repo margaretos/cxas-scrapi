@@ -141,6 +141,63 @@ def test_tools_delete_by_display_name(mock_tools_cls: typing.Any) -> None:
     )
 
 
+@mock.patch("cxas_scrapi.core.tools.Tools", autospec=True)
+def test_tools_delete_toolset_by_display_name(
+    mock_tools_cls: typing.Any,
+) -> None:
+    """Test deleting an OpenAPI/MCP toolset by its display name."""
+    args = argparse.Namespace(
+        app_name="projects/p/locations/l/apps/a", name="weather_api"
+    )
+    mock_inst = mock_tools_cls.return_value
+    mock_inst.get_tools_map.return_value = {
+        "weather_api_getWeather": (
+            "projects/p/locations/l/apps/a/toolsets/uuid-123/tools/getWeather"
+        )
+    }
+    mock_toolset = mock.MagicMock()
+    mock_toolset.name = "projects/p/locations/l/apps/a/toolsets/uuid-123"
+    mock_toolset.display_name = "weather_api"
+    mock_inst.list_tools.return_value = [mock_toolset]
+
+    resources_cli.tools_delete(args)
+    mock_inst.delete_tool.assert_called_once_with(
+        "projects/p/locations/l/apps/a/toolsets/uuid-123"
+    )
+
+
+@mock.patch("cxas_scrapi.core.tools.Tools", autospec=True)
+def test_tools_delete_toolset_operation_reports_error(
+    mock_tools_cls: typing.Any, capsys: typing.Any
+) -> None:
+    """Attempting to delete a single toolset operation exits with error."""
+    import pytest  # noqa: PLC0415
+
+    args = argparse.Namespace(
+        app_name="projects/p/locations/l/apps/a",
+        name="weather_api_getWeather",
+    )
+    mock_inst = mock_tools_cls.return_value
+    op_path = "projects/p/locations/l/apps/a/toolsets/uuid-123/tools/getWeather"
+    mock_inst.get_tools_map.return_value = {
+        "weather_api_getWeather": op_path,
+    }
+    mock_toolset = mock.MagicMock()
+    mock_toolset.name = "projects/p/locations/l/apps/a/toolsets/uuid-123"
+    mock_toolset.display_name = "weather_api"
+    mock_inst.list_tools.return_value = [mock_toolset]
+    mock_inst.delete_tool.side_effect = ValueError(
+        "Cannot delete individual toolset operation"
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        resources_cli.tools_delete(args)
+    assert excinfo.value.code == 1
+    mock_inst.delete_tool.assert_called_once_with(op_path)
+    captured = capsys.readouterr()
+    assert "Cannot delete individual toolset operation" in captured.out
+
+
 @mock.patch("cxas_scrapi.core.agents.Agents", autospec=True)
 @mock.patch("cxas_scrapi.core.callbacks.Callbacks", autospec=True)
 def test_callbacks_list(

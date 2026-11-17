@@ -324,6 +324,13 @@ class Tools(Apps):
     def delete_tool(self, tool_name: str) -> None:
         """Deletes a specific tool or toolset."""
         if self._is_toolset(tool_name):
+            if "/tools/" in tool_name:
+                parent_toolset = tool_name.split("/tools/", maxsplit=1)[0]
+                raise ValueError(
+                    f"Cannot delete individual toolset operation "
+                    f"'{tool_name}'. Delete the parent toolset "
+                    f"'{parent_toolset}' instead."
+                )
             request = types.DeleteToolsetRequest(name=tool_name)
             self.client.delete_toolset(request=request)
         else:
